@@ -1,5 +1,8 @@
 {
   "dependencies": [
-    "libpqxx"
+    {
+      "name": "libpqxx",
+      "platform": "x86"
+    }
   ]
 }

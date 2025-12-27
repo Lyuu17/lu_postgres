@@ -21,20 +21,11 @@ extern HSQUIRRELVM v;
 // Global storage for connections, transactions, and results
 std::vector<std::unique_ptr<pqxx::connection>> g_connections;
 std::vector<std::unique_ptr<pqxx::work>> g_transactions;
-std::vector<std::unique_ptr<pqxx::result>> g_results;
 
-// Helper structure to track result iteration state
-struct ResultIterator {
-	pqxx::result* result;
-	size_t current_row;
-
-	ResultIterator(pqxx::result* res) : result(res), current_row(0) {}
-};
-
-std::vector<std::unique_ptr<ResultIterator>> g_iterators;
+// Results are no longer stored globally - they're returned directly or cleaned up automatically
 
 // Helper function to check if query is a SELECT statement
-static bool is_select_query(const char* query) {
+bool is_select_query(const char* query) {
 	// Skip whitespace
 	while (*query && isspace(*query)) query++;
 
@@ -49,7 +40,7 @@ static bool is_select_query(const char* query) {
 }
 
 // Helper function to add result rows to Squirrel table
-static void push_result_as_table(HSQUIRRELVM v, const pqxx::result& result) {
+void push_result_as_table(HSQUIRRELVM v, const pqxx::result& result) {
 	sq->newtable(v);
 	sq->pushstring(v, "rows", -1);
 	sq->newarray(v, 0);
@@ -115,7 +106,8 @@ static void push_result_as_table(HSQUIRRELVM v, const pqxx::result& result) {
 
 // Connect to PostgreSQL database
 // Usage: postgres_connect(connection_string)
-// Returns: connection handle or null on error
+// Returns: connection handle
+// Throws: error on failure
 _SQUIRRELDEF(SQ_postgres_connect)
 {
 	if (sq->gettype(v, 2) != OT_STRING)
@@ -132,7 +124,6 @@ _SQUIRRELDEF(SQ_postgres_connect)
 		if (!conn->is_open())
 		{
 			g_connections.pop_back();
-			sq->pushnull(v);
 			return sq->throwerror(v, "Failed to open connection");
 		}
 
@@ -140,7 +131,6 @@ _SQUIRRELDEF(SQ_postgres_connect)
 		return 1;
 	}
 	catch (const std::exception& e) {
-		sq->pushnull(v);
 		return sq->throwerror(v, e.what());
 	}
 }
@@ -189,7 +179,8 @@ _SQUIRRELDEF(SQ_postgres_is_open)
 
 // Begin a new transaction
 // Usage: postgres_begin(connection)
-// Returns: transaction handle or null on error
+// Returns: transaction handle
+// Throws: error on failure
 _SQUIRRELDEF(SQ_postgres_begin)
 {
 	if (sq->gettype(v, 2) != OT_USERPOINTER)
@@ -208,7 +199,6 @@ _SQUIRRELDEF(SQ_postgres_begin)
 		return 1;
 	}
 	catch (const std::exception& e) {
-		sq->pushnull(v);
 		return sq->throwerror(v, e.what());
 	}
 }
@@ -275,7 +265,8 @@ _SQUIRRELDEF(SQ_postgres_rollback)
 
 // Execute query within a transaction
 // Usage: postgres_query_txn(transaction, query_string)
-// Returns: table (for SELECT) or result handle (for other queries) or null on error
+// Returns: table with {rows: [...], count: n, affected_rows: n}
+// Throws: error on failure
 _SQUIRRELDEF(SQ_postgres_query_txn)
 {
 	if (sq->gettype(v, 2) != OT_USERPOINTER || sq->gettype(v, 3) != OT_STRING)
@@ -300,23 +291,32 @@ _SQUIRRELDEF(SQ_postgres_query_txn)
 			return 1;
 		}
 		else {
-			// For non-SELECT queries, store result and return handle
-			auto& stored_result = g_results.emplace_back(std::make_unique<pqxx::result>(result));
-			auto& iterator = g_iterators.emplace_back(std::make_unique<ResultIterator>(stored_result.get()));
+			// For non-SELECT queries, return table with affected_rows
+			sq->newtable(v);
+			sq->pushstring(v, "affected_rows", -1);
+			sq->pushinteger(v, (SQInteger)result.affected_rows());
+			sq->rawset(v, -3);
 
-			sq->pushuserpointer(v, iterator.get());
+			sq->pushstring(v, "count", -1);
+			sq->pushinteger(v, 0);
+			sq->rawset(v, -3);
+
+			sq->pushstring(v, "rows", -1);
+			sq->newarray(v, 0);
+			sq->rawset(v, -3);
+
 			return 1;
 		}
 	}
 	catch (const std::exception& e) {
-		sq->pushnull(v);
 		return sq->throwerror(v, e.what());
 	}
 }
 
 // Execute a PostgreSQL query
 // Usage: postgres_query(connection, query_string)
-// Returns: table (for SELECT) or result handle (for other queries) or null on error
+// Returns: table with {rows: [...], count: n, affected_rows: n}
+// Throws: error on failure
 _SQUIRRELDEF(SQ_postgres_query)
 {
 	if (sq->gettype(v, 2) != OT_USERPOINTER || sq->gettype(v, 3) != OT_STRING)
@@ -343,23 +343,32 @@ _SQUIRRELDEF(SQ_postgres_query)
 			return 1;
 		}
 		else {
-			// For non-SELECT queries, store result and return handle
-			auto& stored_result = g_results.emplace_back(std::make_unique<pqxx::result>(result));
-			auto& iterator = g_iterators.emplace_back(std::make_unique<ResultIterator>(stored_result.get()));
+			// For non-SELECT queries, return table with affected_rows
+			sq->newtable(v);
+			sq->pushstring(v, "affected_rows", -1);
+			sq->pushinteger(v, (SQInteger)result.affected_rows());
+			sq->rawset(v, -3);
 
-			sq->pushuserpointer(v, iterator.get());
+			sq->pushstring(v, "count", -1);
+			sq->pushinteger(v, 0);
+			sq->rawset(v, -3);
+
+			sq->pushstring(v, "rows", -1);
+			sq->newarray(v, 0);
+			sq->rawset(v, -3);
+
 			return 1;
 		}
 	}
 	catch (const std::exception& e) {
-		sq->pushnull(v);
 		return sq->throwerror(v, e.what());
 	}
 }
 
 // Execute a non-transactional query (for DDL)
 // Usage: postgres_exec(connection, query_string)
-// Returns: result handle or null on error
+// Returns: table with affected_rows
+// Throws: error on failure
 _SQUIRRELDEF(SQ_postgres_exec)
 {
 	if (sq->gettype(v, 2) != OT_USERPOINTER || sq->gettype(v, 3) != OT_STRING)
@@ -379,75 +388,58 @@ _SQUIRRELDEF(SQ_postgres_exec)
 		pqxx::nontransaction ntxn(*conn);
 		auto result = ntxn.exec(query);
 
-		auto& stored_result = g_results.emplace_back(std::make_unique<pqxx::result>(result));
-		auto& iterator = g_iterators.emplace_back(std::make_unique<ResultIterator>(stored_result.get()));
+		// Return table with affected_rows
+		sq->newtable(v);
+		sq->pushstring(v, "affected_rows", -1);
+		sq->pushinteger(v, (SQInteger)result.affected_rows());
+		sq->rawset(v, -3);
 
-		sq->pushuserpointer(v, iterator.get());
+		sq->pushstring(v, "count", -1);
+		sq->pushinteger(v, 0);
+		sq->rawset(v, -3);
+
+		sq->pushstring(v, "rows", -1);
+		sq->newarray(v, 0);
+		sq->rawset(v, -3);
+
 		return 1;
 	}
 	catch (const std::exception& e) {
-		sq->pushnull(v);
 		return sq->throwerror(v, e.what());
 	}
 }
 
-// Prepare a SQL statement
-// Usage: postgres_prepare(connection, statement_name, query_string)
-// Returns: true on success, null on error
-_SQUIRRELDEF(SQ_postgres_prepare)
-{
-	if (sq->gettype(v, 2) != OT_USERPOINTER ||
-		sq->gettype(v, 3) != OT_STRING ||
-		sq->gettype(v, 4) != OT_STRING)
-	{
-		return sq->throwerror(v, "Error in 'postgres_prepare': Expected (connection, statement_name, query_string)");
-	}
-
-	void* ptr{};
-	const char* stmt_name;
-	const char* query;
-
-	sq->getuserpointer(v, 2, &ptr);
-	sq->getstring(v, 3, &stmt_name);
-	sq->getstring(v, 4, &query);
-
-	auto conn = static_cast<pqxx::connection*>(ptr);
-
-	try {
-		conn->prepare(stmt_name, query);
-		sq->pushbool(v, SQTrue);
-		return 1;
-	}
-	catch (const std::exception& e) {
-		sq->pushnull(v);
-		return sq->throwerror(v, e.what());
-	}
-}
-
-// Execute a prepared statement
-// Usage: postgres_execute(connection, statement_name, [param1, param2, ...])
-// Returns: table (for SELECT) or result handle (for other queries) or null on error
-_SQUIRRELDEF(SQ_postgres_execute)
+// Execute a prepared statement (creates and executes in one call)
+// Usage: postgres_prepared(connection, query_string, [param1, param2, ...])
+// Returns: table with {rows: [...], count: n, affected_rows: n}
+// Throws: error on failure
+_SQUIRRELDEF(SQ_postgres_prepared)
 {
 	if (sq->gettype(v, 2) != OT_USERPOINTER || sq->gettype(v, 3) != OT_STRING)
 	{
-		return sq->throwerror(v, "Error in 'postgres_execute': Expected at least (connection, statement_name)");
+		return sq->throwerror(v, "Error in 'postgres_prepared': Expected at least (connection, query_string)");
 	}
 
 	void* ptr{};
-	const char* stmt_name;
+	const char* query;
 
 	sq->getuserpointer(v, 2, &ptr);
-	sq->getstring(v, 3, &stmt_name);
+	sq->getstring(v, 3, &query);
 
 	auto conn = static_cast<pqxx::connection*>(ptr);
 
 	try {
 		pqxx::work txn(*conn);
 
-		// Get the number of parameters (arguments beyond connection and statement name)
+		// Get the number of parameters (arguments beyond connection and query)
 		SQInteger top = sq->gettop(v);
 		SQInteger param_count = top - 3;
+
+		// Use a simple fixed statement name
+		const char* stmt_name = "sq_stmt";
+
+		// Prepare the statement (will replace if it already exists)
+		conn->prepare(stmt_name, query);
 
 		// Build parameter list
 		std::vector<std::string> params;
@@ -486,7 +478,8 @@ _SQUIRRELDEF(SQ_postgres_execute)
 			}
 			else
 			{
-				return sq->throwerror(v, "Error in 'postgres_execute': Invalid parameter type");
+				conn->unprepare(stmt_name);
+				return sq->throwerror(v, "Error in 'postgres_prepared': Invalid parameter type");
 			}
 		}
 
@@ -506,114 +499,164 @@ _SQUIRRELDEF(SQ_postgres_execute)
 		case 9: result = txn.exec_prepared(stmt_name, params[0], params[1], params[2], params[3], params[4], params[5], params[6], params[7], params[8]); break;
 		case 10: result = txn.exec_prepared(stmt_name, params[0], params[1], params[2], params[3], params[4], params[5], params[6], params[7], params[8], params[9]); break;
 		default:
-			return sq->throwerror(v, "Error in 'postgres_execute': Too many parameters (max 10)");
+			conn->unprepare(stmt_name);
+			return sq->throwerror(v, "Error in 'postgres_prepared': Too many parameters (max 10)");
 		}
+
+		// Unprepare the statement
+		conn->unprepare(stmt_name);
 
 		txn.commit();
 
-		// Check if this looks like a SELECT query by checking if we have columns and rows
+		// Check if this looks like a SELECT query
 		if (result.columns() > 0 && result.size() > 0) {
 			push_result_as_table(v, result);
 			return 1;
 		}
 		else {
-			// For non-SELECT queries, store result and return handle
-			auto& stored_result = g_results.emplace_back(std::make_unique<pqxx::result>(result));
-			auto& iterator = g_iterators.emplace_back(std::make_unique<ResultIterator>(stored_result.get()));
+			// For non-SELECT queries, return table with affected_rows
+			sq->newtable(v);
+			sq->pushstring(v, "affected_rows", -1);
+			sq->pushinteger(v, (SQInteger)result.affected_rows());
+			sq->rawset(v, -3);
 
-			sq->pushuserpointer(v, iterator.get());
+			sq->pushstring(v, "count", -1);
+			sq->pushinteger(v, 0);
+			sq->rawset(v, -3);
+
+			sq->pushstring(v, "rows", -1);
+			sq->newarray(v, 0);
+			sq->rawset(v, -3);
+
 			return 1;
 		}
 	}
 	catch (const std::exception& e) {
-		sq->pushnull(v);
 		return sq->throwerror(v, e.what());
 	}
 }
 
-// Unprepare a SQL statement
-// Usage: postgres_unprepare(connection, statement_name)
-// Returns: true on success
-_SQUIRRELDEF(SQ_postgres_unprepare)
+// Execute a prepared statement within a transaction
+// Usage: postgres_prepared_txn(transaction, query_string, [param1, param2, ...])
+// Returns: table with {rows: [...], count: n, affected_rows: n}
+// Throws: error on failure
+_SQUIRRELDEF(SQ_postgres_prepared_txn)
 {
 	if (sq->gettype(v, 2) != OT_USERPOINTER || sq->gettype(v, 3) != OT_STRING)
 	{
-		return sq->throwerror(v, "Error in 'postgres_unprepare': Expected (connection, statement_name)");
+		return sq->throwerror(v, "Error in 'postgres_prepared_txn': Expected at least (transaction, query_string)");
 	}
 
 	void* ptr{};
-	const char* stmt_name;
+	const char* query;
 
 	sq->getuserpointer(v, 2, &ptr);
-	sq->getstring(v, 3, &stmt_name);
+	sq->getstring(v, 3, &query);
 
-	auto conn = static_cast<pqxx::connection*>(ptr);
+	auto txn = static_cast<pqxx::work*>(ptr);
 
 	try {
-		conn->unprepare(stmt_name);
-		sq->pushbool(v, SQTrue);
-		return 1;
+		// Get the number of parameters (arguments beyond transaction and query)
+		SQInteger top = sq->gettop(v);
+		SQInteger param_count = top - 3;
+
+		// Use a simple fixed statement name
+		const char* stmt_name = "sq_stmt_txn";
+
+		// Prepare the statement (will replace if it already exists)
+		txn->conn().prepare(stmt_name, query);
+
+		// Build parameter list
+		std::vector<std::string> params;
+		for (SQInteger i = 0; i < param_count; ++i)
+		{
+			SQInteger idx = 4 + i;
+			SQObjectType param_type = sq->gettype(v, idx);
+
+			if (param_type == OT_NULL)
+			{
+				params.push_back("");
+			}
+			else if (param_type == OT_INTEGER)
+			{
+				SQInteger val;
+				sq->getinteger(v, idx, &val);
+				params.push_back(std::to_string(val));
+			}
+			else if (param_type == OT_FLOAT)
+			{
+				SQFloat val;
+				sq->getfloat(v, idx, &val);
+				params.push_back(std::to_string(val));
+			}
+			else if (param_type == OT_BOOL)
+			{
+				SQBool val;
+				sq->getbool(v, idx, &val);
+				params.push_back(val ? "true" : "false");
+			}
+			else if (param_type == OT_STRING)
+			{
+				const char* val;
+				sq->getstring(v, idx, &val);
+				params.push_back(val);
+			}
+			else
+			{
+				txn->conn().unprepare(stmt_name);
+				return sq->throwerror(v, "Error in 'postgres_prepared_txn': Invalid parameter type");
+			}
+		}
+
+		// Execute the prepared statement
+		pqxx::result result;
+		switch (params.size())
+		{
+		case 0: result = txn->exec_prepared(stmt_name); break;
+		case 1: result = txn->exec_prepared(stmt_name, params[0]); break;
+		case 2: result = txn->exec_prepared(stmt_name, params[0], params[1]); break;
+		case 3: result = txn->exec_prepared(stmt_name, params[0], params[1], params[2]); break;
+		case 4: result = txn->exec_prepared(stmt_name, params[0], params[1], params[2], params[3]); break;
+		case 5: result = txn->exec_prepared(stmt_name, params[0], params[1], params[2], params[3], params[4]); break;
+		case 6: result = txn->exec_prepared(stmt_name, params[0], params[1], params[2], params[3], params[4], params[5]); break;
+		case 7: result = txn->exec_prepared(stmt_name, params[0], params[1], params[2], params[3], params[4], params[5], params[6]); break;
+		case 8: result = txn->exec_prepared(stmt_name, params[0], params[1], params[2], params[3], params[4], params[5], params[6], params[7]); break;
+		case 9: result = txn->exec_prepared(stmt_name, params[0], params[1], params[2], params[3], params[4], params[5], params[6], params[7], params[8]); break;
+		case 10: result = txn->exec_prepared(stmt_name, params[0], params[1], params[2], params[3], params[4], params[5], params[6], params[7], params[8], params[9]); break;
+		default:
+			txn->conn().unprepare(stmt_name);
+			return sq->throwerror(v, "Error in 'postgres_prepared_txn': Too many parameters (max 10)");
+		}
+
+		// Unprepare the statement
+		txn->conn().unprepare(stmt_name);
+
+		// Check if this looks like a SELECT query
+		if (result.columns() > 0 && result.size() > 0) {
+			push_result_as_table(v, result);
+			return 1;
+		}
+		else {
+			// For non-SELECT queries, return table with affected_rows
+			sq->newtable(v);
+			sq->pushstring(v, "affected_rows", -1);
+			sq->pushinteger(v, (SQInteger)result.affected_rows());
+			sq->rawset(v, -3);
+
+			sq->pushstring(v, "count", -1);
+			sq->pushinteger(v, 0);
+			sq->rawset(v, -3);
+
+			sq->pushstring(v, "rows", -1);
+			sq->newarray(v, 0);
+			sq->rawset(v, -3);
+
+			return 1;
+		}
 	}
 	catch (const std::exception& e) {
 		return sq->throwerror(v, e.what());
 	}
-}
-
-// Get number of affected rows from last query
-// Usage: postgres_affected_rows(result)
-// Returns: number of affected rows
-_SQUIRRELDEF(SQ_postgres_affected_rows)
-{
-	if (sq->gettype(v, 2) != OT_USERPOINTER)
-	{
-		return sq->throwerror(v, "Error in 'postgres_affected_rows': Expected result handle");
-	}
-
-	void* ptr{};
-	sq->getuserpointer(v, 2, &ptr);
-
-	auto iterator = static_cast<ResultIterator*>(ptr);
-	sq->pushinteger(v, (SQInteger)iterator->result->affected_rows());
-	return 1;
-}
-
-// Free result and associated resources
-// Usage: postgres_free_result(result)
-// Returns: true on success
-_SQUIRRELDEF(SQ_postgres_free_result)
-{
-	if (sq->gettype(v, 2) != OT_USERPOINTER)
-	{
-		return sq->throwerror(v, "Error in 'postgres_free_result': Expected result handle");
-	}
-
-	void* ptr{};
-	sq->getuserpointer(v, 2, &ptr);
-
-	// Remove the iterator
-	for (auto it = g_iterators.begin(); it != g_iterators.end(); ++it)
-	{
-		if (it->get() == ptr)
-		{
-			auto result_ptr = (*it)->result;
-			g_iterators.erase(it);
-
-			// Remove the result
-			for (auto res_it = g_results.begin(); res_it != g_results.end(); ++res_it)
-			{
-				if (res_it->get() == result_ptr)
-				{
-					g_results.erase(res_it);
-					break;
-				}
-			}
-
-			sq->pushbool(v, SQTrue);
-			return 1;
-		}
-	}
-
-	return sq->throwerror(v, "Error in 'postgres_free_result': Invalid result handle");
 }
 
 // Escape string for use in queries
@@ -703,6 +746,141 @@ _SQUIRRELDEF(SQ_postgres_quote_name)
 	}
 }
 
+// Get database version string
+// Usage: postgres_version(connection)
+// Returns: version string
+_SQUIRRELDEF(SQ_postgres_version)
+{
+	if (sq->gettype(v, 2) != OT_USERPOINTER)
+	{
+		return sq->throwerror(v, "Error in 'postgres_version': Expected connection handle");
+	}
+
+	void* ptr{};
+	sq->getuserpointer(v, 2, &ptr);
+
+	auto conn = static_cast<pqxx::connection*>(ptr);
+
+	try {
+		int version = conn->server_version();
+		char version_str[64];
+		snprintf(version_str, sizeof(version_str), "%d.%d.%d",
+			version / 10000,
+			(version / 100) % 100,
+			version % 100);
+		sq->pushstring(v, version_str, -1);
+		return 1;
+	}
+	catch (const std::exception& e)
+	{
+		return sq->throwerror(v, e.what());
+	}
+}
+
+// Get database name
+// Usage: postgres_dbname(connection)
+// Returns: database name
+_SQUIRRELDEF(SQ_postgres_dbname)
+{
+	if (sq->gettype(v, 2) != OT_USERPOINTER)
+	{
+		return sq->throwerror(v, "Error in 'postgres_dbname': Expected connection handle");
+	}
+
+	void* ptr{};
+	sq->getuserpointer(v, 2, &ptr);
+
+	auto conn = static_cast<pqxx::connection*>(ptr);
+
+	try {
+		std::string dbname = conn->dbname();
+		sq->pushstring(v, dbname.c_str(), dbname.length());
+		return 1;
+	}
+	catch (const std::exception& e)
+	{
+		return sq->throwerror(v, e.what());
+	}
+}
+
+// Get username
+// Usage: postgres_username(connection)
+// Returns: username
+_SQUIRRELDEF(SQ_postgres_username)
+{
+	if (sq->gettype(v, 2) != OT_USERPOINTER)
+	{
+		return sq->throwerror(v, "Error in 'postgres_username': Expected connection handle");
+	}
+
+	void* ptr{};
+	sq->getuserpointer(v, 2, &ptr);
+
+	auto conn = static_cast<pqxx::connection*>(ptr);
+
+	try {
+		std::string username = conn->username();
+		sq->pushstring(v, username.c_str(), username.length());
+		return 1;
+	}
+	catch (const std::exception& e)
+	{
+		return sq->throwerror(v, e.what());
+	}
+}
+
+// Get hostname
+// Usage: postgres_hostname(connection)
+// Returns: hostname
+_SQUIRRELDEF(SQ_postgres_hostname)
+{
+	if (sq->gettype(v, 2) != OT_USERPOINTER)
+	{
+		return sq->throwerror(v, "Error in 'postgres_hostname': Expected connection handle");
+	}
+
+	void* ptr{};
+	sq->getuserpointer(v, 2, &ptr);
+
+	auto conn = static_cast<pqxx::connection*>(ptr);
+
+	try {
+		std::string hostname = conn->hostname();
+		sq->pushstring(v, hostname.c_str(), hostname.length());
+		return 1;
+	}
+	catch (const std::exception& e)
+	{
+		return sq->throwerror(v, e.what());
+	}
+}
+
+// Get port
+// Usage: postgres_port(connection)
+// Returns: port number as string
+_SQUIRRELDEF(SQ_postgres_port)
+{
+	if (sq->gettype(v, 2) != OT_USERPOINTER)
+	{
+		return sq->throwerror(v, "Error in 'postgres_port': Expected connection handle");
+	}
+
+	void* ptr{};
+	sq->getuserpointer(v, 2, &ptr);
+
+	auto conn = static_cast<pqxx::connection*>(ptr);
+
+	try {
+		std::string port = conn->port();
+		sq->pushstring(v, port.c_str(), port.length());
+		return 1;
+	}
+	catch (const std::exception& e)
+	{
+		return sq->throwerror(v, e.what());
+	}
+}
+
 //--------------------------------------------------
 
 SQInteger RegisterSquirrelFunc(HSQUIRRELVM v, SQFUNCTION f, const SQChar* fname, unsigned char ucParams, const SQChar* szParams)
@@ -745,22 +923,24 @@ void RegisterFuncs(HSQUIRRELVM v)
 	RegisterSquirrelFunc(v, SQ_postgres_commit, "postgres_commit", 0, 0);
 	RegisterSquirrelFunc(v, SQ_postgres_rollback, "postgres_rollback", 0, 0);
 	RegisterSquirrelFunc(v, SQ_postgres_query_txn, "postgres_query_txn", 0, 0);
+	RegisterSquirrelFunc(v, SQ_postgres_prepared_txn, "postgres_prepared_txn", 0, 0);
 
 	// Query execution functions
 	RegisterSquirrelFunc(v, SQ_postgres_query, "postgres_query", 0, 0);
 	RegisterSquirrelFunc(v, SQ_postgres_exec, "postgres_exec", 0, 0);
 
-	// Prepared statement functions
-	RegisterSquirrelFunc(v, SQ_postgres_prepare, "postgres_prepare", 0, 0);
-	RegisterSquirrelFunc(v, SQ_postgres_execute, "postgres_execute", 0, 0);
-	RegisterSquirrelFunc(v, SQ_postgres_unprepare, "postgres_unprepare", 0, 0);
-
-	// Result functions
-	RegisterSquirrelFunc(v, SQ_postgres_affected_rows, "postgres_affected_rows", 0, 0);
-	RegisterSquirrelFunc(v, SQ_postgres_free_result, "postgres_free_result", 0, 0);
+	// Prepared statement function
+	RegisterSquirrelFunc(v, SQ_postgres_prepared, "postgres_prepared", 0, 0);
 
 	// String escaping functions
 	RegisterSquirrelFunc(v, SQ_postgres_escape_string, "postgres_escape_string", 0, 0);
 	RegisterSquirrelFunc(v, SQ_postgres_quote, "postgres_quote", 0, 0);
 	RegisterSquirrelFunc(v, SQ_postgres_quote_name, "postgres_quote_name", 0, 0);
+
+	// Connection information functions
+	RegisterSquirrelFunc(v, SQ_postgres_version, "postgres_version", 0, 0);
+	RegisterSquirrelFunc(v, SQ_postgres_dbname, "postgres_dbname", 0, 0);
+	RegisterSquirrelFunc(v, SQ_postgres_username, "postgres_username", 0, 0);
+	RegisterSquirrelFunc(v, SQ_postgres_hostname, "postgres_hostname", 0, 0);
+	RegisterSquirrelFunc(v, SQ_postgres_port, "postgres_port", 0, 0);
 }
