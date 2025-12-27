@@ -1,19 +1,21 @@
+/*
+	PostgreSQL Functions for Squirrel
+	Uses libpqxx C++ library for PostgreSQL connectivity
+*/
 
 #include "funcs.hpp"
 #include <pqxx/pqxx>
 #include <sdk/SQModule.h>
 #include <sdk/squirrel.h>
+#include <string.h>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <vector>
 #include <memory>
+#include <stdexcept>
 #include <cctype>
-#include <pqxx/connection.hxx>
-#include <pqxx/internal/libpq-forward.hxx>
-#include <pqxx/nontransaction.hxx>
-#include <pqxx/result.hxx>
-#include <pqxx/transaction.hxx>
-#include <string>
+#include <functional>
 
 extern SQAPI sq;
 extern HSQUIRRELVM v;
@@ -38,6 +40,188 @@ bool is_select_query(const char* query) {
 	}
 	return true;
 }
+
+// Shared JSON parser for both automatic decoding and manual decode function
+struct JSONParser {
+	const char* str;
+	size_t pos;
+	HSQUIRRELVM vm;
+	SQAPI sq;
+
+	JSONParser(const char* s, HSQUIRRELVM v, SQAPI api) : str(s), pos(0), vm(v), sq(api) {}
+
+	void skipWhitespace() {
+		while (str[pos] && (str[pos] == ' ' || str[pos] == '\t' || str[pos] == '\n' || str[pos] == '\r')) {
+			pos++;
+		}
+	}
+
+	bool parseValue() {
+		skipWhitespace();
+
+		if (!str[pos]) return false;
+
+		if (str[pos] == '{') return parseObject();
+		if (str[pos] == '[') return parseArray();
+		if (str[pos] == '"') return parseString();
+		if (str[pos] == 't' || str[pos] == 'f') return parseBool();
+		if (str[pos] == 'n') return parseNull();
+		if (str[pos] == '-' || (str[pos] >= '0' && str[pos] <= '9')) return parseNumber();
+
+		return false;
+	}
+
+	bool parseObject() {
+		pos++; // skip '{'
+		sq->newtable(vm);
+
+		skipWhitespace();
+		if (str[pos] == '}') {
+			pos++;
+			return true;
+		}
+
+		while (true) {
+			skipWhitespace();
+
+			// Parse key
+			if (str[pos] != '"') return false;
+			if (!parseString()) return false;
+
+			skipWhitespace();
+			if (str[pos] != ':') return false;
+			pos++;
+
+			// Parse value
+			if (!parseValue()) return false;
+
+			// Add to table
+			sq->rawset(vm, -3);
+
+			skipWhitespace();
+			if (str[pos] == '}') {
+				pos++;
+				return true;
+			}
+			if (str[pos] != ',') return false;
+			pos++;
+		}
+	}
+
+	bool parseArray() {
+		pos++; // skip '['
+		sq->newarray(vm, 0);
+
+		skipWhitespace();
+		if (str[pos] == ']') {
+			pos++;
+			return true;
+		}
+
+		while (true) {
+			if (!parseValue()) return false;
+			sq->arrayappend(vm, -2);
+
+			skipWhitespace();
+			if (str[pos] == ']') {
+				pos++;
+				return true;
+			}
+			if (str[pos] != ',') return false;
+			pos++;
+		}
+	}
+
+	bool parseString() {
+		pos++; // skip opening '"'
+		std::string result;
+
+		while (str[pos] && str[pos] != '"') {
+			if (str[pos] == '\\') {
+				pos++;
+				if (!str[pos]) return false;
+
+				switch (str[pos]) {
+				case '"': result += '"'; break;
+				case '\\': result += '\\'; break;
+				case '/': result += '/'; break;
+				case 'b': result += '\b'; break;
+				case 'f': result += '\f'; break;
+				case 'n': result += '\n'; break;
+				case 'r': result += '\r'; break;
+				case 't': result += '\t'; break;
+				default: result += str[pos]; break;
+				}
+				pos++;
+			}
+			else {
+				result += str[pos++];
+			}
+		}
+
+		if (str[pos] != '"') return false;
+		pos++; // skip closing '"'
+
+		sq->pushstring(vm, result.c_str(), result.length());
+		return true;
+	}
+
+	bool parseNumber() {
+		size_t start = pos;
+		bool is_float = false;
+
+		if (str[pos] == '-') pos++;
+
+		while (str[pos] >= '0' && str[pos] <= '9') pos++;
+
+		if (str[pos] == '.') {
+			is_float = true;
+			pos++;
+			while (str[pos] >= '0' && str[pos] <= '9') pos++;
+		}
+
+		if (str[pos] == 'e' || str[pos] == 'E') {
+			is_float = true;
+			pos++;
+			if (str[pos] == '+' || str[pos] == '-') pos++;
+			while (str[pos] >= '0' && str[pos] <= '9') pos++;
+		}
+
+		std::string num_str(str + start, pos - start);
+
+		if (is_float) {
+			sq->pushfloat(vm, std::stod(num_str));
+		}
+		else {
+			sq->pushinteger(vm, std::stoll(num_str));
+		}
+
+		return true;
+	}
+
+	bool parseBool() {
+		if (strncmp(str + pos, "true", 4) == 0) {
+			sq->pushbool(vm, SQTrue);
+			pos += 4;
+			return true;
+		}
+		if (strncmp(str + pos, "false", 5) == 0) {
+			sq->pushbool(vm, SQFalse);
+			pos += 5;
+			return true;
+		}
+		return false;
+	}
+
+	bool parseNull() {
+		if (strncmp(str + pos, "null", 4) == 0) {
+			sq->pushnull(vm);
+			pos += 4;
+			return true;
+		}
+		return false;
+	}
+};
 
 // Helper function to add result rows to Squirrel table
 void push_result_as_table(HSQUIRRELVM v, const pqxx::result& result) {
@@ -66,7 +250,19 @@ void push_result_as_table(HSQUIRRELVM v, const pqxx::result& result) {
 				try {
 					pqxx::oid type_oid = field.type();
 
-					if (type_oid == 21 || type_oid == 23 || type_oid == 20)
+					// JSON (114) and JSONB (3802) types - automatically decode
+					if (type_oid == 114 || type_oid == 3802)
+					{
+						std::string json_str = field.c_str();
+
+						// Use shared JSON parser
+						JSONParser parser(json_str.c_str(), v, sq);
+						if (!parser.parseValue()) {
+							// If parsing fails, return as string
+							sq->pushstring(v, json_str.c_str(), json_str.length());
+						}
+					}
+					else if (type_oid == 21 || type_oid == 23 || type_oid == 20)
 					{
 						sq->pushinteger(v, field.as<long long>());
 					}
@@ -426,6 +622,9 @@ _SQUIRRELDEF(SQ_postgres_prepared)
 	sq->getuserpointer(v, 2, &ptr);
 	sq->getstring(v, 3, &query);
 
+	// Use a simple fixed statement name
+	const char* stmt_name = "sq_stmt";
+
 	auto conn = static_cast<pqxx::connection*>(ptr);
 
 	try {
@@ -434,9 +633,6 @@ _SQUIRRELDEF(SQ_postgres_prepared)
 		// Get the number of parameters (arguments beyond connection and query)
 		SQInteger top = sq->gettop(v);
 		SQInteger param_count = top - 3;
-
-		// Use a simple fixed statement name
-		const char* stmt_name = "sq_stmt";
 
 		// Prepare the statement (will replace if it already exists)
 		conn->prepare(stmt_name, query);
@@ -532,6 +728,13 @@ _SQUIRRELDEF(SQ_postgres_prepared)
 		}
 	}
 	catch (const std::exception& e) {
+		// Unprepare statement on error
+		try {
+			conn->unprepare(stmt_name);
+		}
+		catch (...) {
+			// Ignore unprepare errors
+		}
 		return sq->throwerror(v, e.what());
 	}
 }
@@ -555,13 +758,13 @@ _SQUIRRELDEF(SQ_postgres_prepared_txn)
 
 	auto txn = static_cast<pqxx::work*>(ptr);
 
+	// Use a simple fixed statement name
+	const char* stmt_name = "sq_stmt_txn";
+
 	try {
 		// Get the number of parameters (arguments beyond transaction and query)
 		SQInteger top = sq->gettop(v);
 		SQInteger param_count = top - 3;
-
-		// Use a simple fixed statement name
-		const char* stmt_name = "sq_stmt_txn";
 
 		// Prepare the statement (will replace if it already exists)
 		txn->conn().prepare(stmt_name, query);
@@ -655,6 +858,13 @@ _SQUIRRELDEF(SQ_postgres_prepared_txn)
 		}
 	}
 	catch (const std::exception& e) {
+		// Unprepare statement on error
+		try {
+			txn->conn().unprepare(stmt_name);
+		}
+		catch (...) {
+			// Ignore unprepare errors
+		}
 		return sq->throwerror(v, e.what());
 	}
 }
@@ -881,6 +1091,215 @@ _SQUIRRELDEF(SQ_postgres_port)
 	}
 }
 
+// Parse JSON string and return as Squirrel table/array
+// Usage: postgres_json_decode(json_string)
+// Returns: Squirrel value (table, array, string, number, bool, or null)
+// Throws: error on invalid JSON
+_SQUIRRELDEF(SQ_postgres_json_decode)
+{
+	if (sq->gettype(v, 2) != OT_STRING)
+	{
+		return sq->throwerror(v, "Error in 'postgres_json_decode': Expected JSON string");
+	}
+
+	const char* json_str;
+	sq->getstring(v, 2, &json_str);
+
+	try {
+		JSONParser parser(json_str, v, sq);
+		if (!parser.parseValue()) {
+			return sq->throwerror(v, "Invalid JSON");
+		}
+		return 1;
+	}
+	catch (const std::exception& e) {
+		return sq->throwerror(v, e.what());
+	}
+}
+
+// Convert Squirrel value to JSON string
+// Usage: postgres_json_encode(value)
+// Returns: JSON string
+// Throws: error on failure
+_SQUIRRELDEF(SQ_postgres_json_encode)
+{
+	if (sq->gettop(v) < 2) {
+		return sq->throwerror(v, "Error in 'postgres_json_encode': Expected a value to encode");
+	}
+
+	std::string result;
+
+	// Recursive JSON encoder
+	std::function<bool(int)> encodeValue = [&](int idx) -> bool {
+		SQObjectType type = sq->gettype(v, idx);
+
+		switch (type) {
+		case OT_NULL:
+			result += "null";
+			return true;
+
+		case OT_INTEGER: {
+			SQInteger val;
+			sq->getinteger(v, idx, &val);
+			result += std::to_string(val);
+			return true;
+		}
+
+		case OT_FLOAT: {
+			SQFloat val;
+			sq->getfloat(v, idx, &val);
+			result += std::to_string(val);
+			return true;
+		}
+
+		case OT_BOOL: {
+			SQBool val;
+			sq->getbool(v, idx, &val);
+			result += val ? "true" : "false";
+			return true;
+		}
+
+		case OT_STRING: {
+			const char* val;
+			sq->getstring(v, idx, &val);
+			result += '"';
+
+			// Escape special characters
+			for (const char* p = val; *p; p++) {
+				switch (*p) {
+				case '"': result += "\\\""; break;
+				case '\\': result += "\\\\"; break;
+				case '\b': result += "\\b"; break;
+				case '\f': result += "\\f"; break;
+				case '\n': result += "\\n"; break;
+				case '\r': result += "\\r"; break;
+				case '\t': result += "\\t"; break;
+				default:
+					if (*p < 32) {
+						char buf[8];
+						snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)*p);
+						result += buf;
+					}
+					else {
+						result += *p;
+					}
+					break;
+				}
+			}
+			result += '"';
+			return true;
+		}
+
+		case OT_TABLE: {
+			result += '{';
+			bool first = true;
+
+			// Push the table for iteration
+			sq->push(v, idx);
+
+			// Push null iterator
+			sq->pushnull(v);
+
+			while (SQ_SUCCEEDED(sq->next(v, -2))) {
+				if (!first) result += ',';
+				first = false;
+
+				// Key (must be a string for JSON)
+				if (sq->gettype(v, -2) == OT_STRING) {
+					const char* key;
+					sq->getstring(v, -2, &key);
+
+					// Check if key needs escaping
+					result += '"';
+					for (const char* p = key; *p; p++) {
+						switch (*p) {
+						case '"': result += "\\\""; break;
+						case '\\': result += "\\\\"; break;
+						case '\b': result += "\\b"; break;
+						case '\f': result += "\\f"; break;
+						case '\n': result += "\\n"; break;
+						case '\r': result += "\\r"; break;
+						case '\t': result += "\\t"; break;
+						default:
+							if (*p < 32) {
+								char buf[8];
+								snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)*p);
+								result += buf;
+							}
+							else {
+								result += *p;
+							}
+							break;
+						}
+					}
+					result += "\":";
+
+					// Value
+					if (!encodeValue(-1)) {
+						sq->pop(v, 4); // pop value, key, iterator, and table copy
+						return false;
+					}
+				}
+				else {
+					// Skip non-string keys (JSON only supports string keys)
+					sq->pop(v, 2); // pop key and value
+					continue;
+				}
+
+				sq->pop(v, 2); // pop key and value
+			}
+
+			sq->pop(v, 2); // pop iterator and table copy
+			result += '}';
+			return true;
+		}
+
+		case OT_ARRAY: {
+			result += '[';
+
+			// Push the array to iterate
+			sq->push(v, idx);
+
+			// Push null iterator
+			sq->pushnull(v);
+
+			bool first = true;
+			while (SQ_SUCCEEDED(sq->next(v, -2))) {
+				if (!first) result += ',';
+				first = false;
+
+				// Get the value (skip the integer key)
+				if (!encodeValue(-1)) {
+					sq->pop(v, 4); // pop value, key, iterator, and array copy
+					return false;
+				}
+
+				sq->pop(v, 2); // pop value and key
+			}
+
+			sq->pop(v, 2); // pop iterator and array copy
+			result += ']';
+			return true;
+		}
+
+		default:
+			return false;
+		}
+		};
+
+	try {
+		if (!encodeValue(2)) {
+			return sq->throwerror(v, "Cannot encode value to JSON");
+		}
+
+		sq->pushstring(v, result.c_str(), result.length());
+		return 1;
+	}
+	catch (const std::exception& e) {
+		return sq->throwerror(v, e.what());
+	}
+}
+
 //--------------------------------------------------
 
 SQInteger RegisterSquirrelFunc(HSQUIRRELVM v, SQFUNCTION f, const SQChar* fname, unsigned char ucParams, const SQChar* szParams)
@@ -943,4 +1362,8 @@ void RegisterFuncs(HSQUIRRELVM v)
 	RegisterSquirrelFunc(v, SQ_postgres_username, "postgres_username", 0, 0);
 	RegisterSquirrelFunc(v, SQ_postgres_hostname, "postgres_hostname", 0, 0);
 	RegisterSquirrelFunc(v, SQ_postgres_port, "postgres_port", 0, 0);
+
+	// JSON functions
+	RegisterSquirrelFunc(v, SQ_postgres_json_decode, "postgres_json_decode", 0, 0);
+	RegisterSquirrelFunc(v, SQ_postgres_json_encode, "postgres_json_encode", 0, 0);
 }
