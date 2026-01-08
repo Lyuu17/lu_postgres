@@ -1,0 +1,190 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        build_type: [Release, Debug]
+        include:
+          - os: ubuntu-latest
+            triplet: x86-linux
+            cmake_arch: -m32
+          - os: windows-latest
+            triplet: x86-windows
+            cmake_arch: Win32
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Install system dependencies (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo dpkg --add-architecture i386
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          cmake \
+          ninja-build \
+          gcc-multilib \
+          g++-multilib \
+          libpq-dev:i386
+
+    - name: Install Ninja (Windows)
+      if: matrix.os == 'windows-latest'
+      run: choco install ninja
+
+    - name: Setup MSVC (Windows)
+      if: matrix.os == 'windows-latest'
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x86
+
+    - name: Initialize vcpkg (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        cd vcpkg
+        git fetch --all
+        ./bootstrap-vcpkg.sh -disableMetrics
+        echo "VCPKG_ROOT=${{ github.workspace }}/vcpkg" >> $GITHUB_ENV
+
+    - name: Initialize vcpkg (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        cd vcpkg
+        git fetch --all
+        .\bootstrap-vcpkg.bat -disableMetrics
+        echo "VCPKG_ROOT=${{ github.workspace }}\vcpkg" >> $env:GITHUB_ENV
+      shell: pwsh
+
+    - name: Install vcpkg dependencies (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        ${{ github.workspace }}/vcpkg/vcpkg install --triplet=${{ matrix.triplet }}
+
+    - name: Install vcpkg dependencies (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        ${{ github.workspace }}\vcpkg\vcpkg.exe install --triplet=${{ matrix.triplet }}
+      shell: pwsh
+
+    - name: Configure CMake (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+          -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake \
+          -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} \
+          -DCMAKE_C_FLAGS="-m32" \
+          -DCMAKE_CXX_FLAGS="-m32" \
+          -G Ninja
+
+    - name: Configure CMake (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        cmake -B build `
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} `
+          -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+          -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} `
+          -G Ninja
+      shell: pwsh
+
+    - name: Build (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: cmake --build build --config ${{ matrix.build_type }} -j $(nproc)
+
+    - name: Build (Windows)
+      if: matrix.os == 'windows-latest'
+      run: cmake --build build --config ${{ matrix.build_type }} --parallel
+
+    - name: Run tests
+      working-directory: build
+      run: ctest -C ${{ matrix.build_type }} --output-on-failure --verbose
+      continue-on-error: true
+
+    - name: Upload build artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-${{ matrix.os }}-${{ matrix.build_type }}
+        path: |
+          build/
+          !build/_deps/
+          !build/vcpkg_installed/
+        retention-days: 7
+
+  lint:
+    name: Lint and Format Check
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install clang-format
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang-format
+
+    - name: Check formatting
+      run: |
+        find lu_postgres -name '*.cpp' -o -name '*.h' -o -name '*.hpp' -o -name '*.c' | \
+          xargs clang-format --dry-run --Werror
+      continue-on-error: true
+
+  static-analysis:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Initialize vcpkg
+      run: |
+        cd vcpkg
+        git fetch --all
+        ./bootstrap-vcpkg.sh -disableMetrics
+
+    - name: Install dependencies
+      run: |
+        sudo dpkg --add-architecture i386
+        sudo apt-get update
+        sudo apt-get install -y \
+          clang-tidy \
+          cppcheck \
+          gcc-multilib \
+          g++-multilib \
+          libpq-dev:i386
+
+    - name: Run cppcheck
+      run: |
+        cppcheck --enable=all --inconclusive --std=c++17 \
+          --suppress=missingIncludeSystem \
+          lu_postgres/ 2>&1 | tee cppcheck-report.txt
+      continue-on-error: true
+
+    - name: Upload static analysis results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: static-analysis-results
+        path: cppcheck-report.txt
+        retention-days: 30
